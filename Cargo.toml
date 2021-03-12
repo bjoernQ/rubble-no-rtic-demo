@@ -1,0 +1,29 @@
+[package]
+name = "rubble-demo"
+version = "0.1.0"
+authors = ["Bjoern Quentin <bjoern.quentin@mobile-j.de>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rubble = { path = "../rubble_fork/rubble/rubble", default-features = false, features = [ "log" ] }
+rubble-nrf5x = { path = "../rubble_fork/rubble/rubble-nrf5x", features = ["52832"] }
+cortex-m = "0.6.3"
+cortex-m-rt = "0.6.13"
+bbqueue = "0.4.1"
+rtt-target = { version = "0.3.0", features = ["cortex-m"] }
+panic-rtt-target = { version = "0.1.1", features = ["cortex-m"] }
+nrf52832-hal = { version = "0.12", features = ["rt"] }
+nrf52832-pac = "0.9.0"
+embedded-hal = "0.2.4"
+log = { version = "0.4.8", features = ["release_max_level_warn"] }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+opt-level = "s"
+debug = true
+lto = true
+codegen-units = 1
