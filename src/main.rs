@@ -5,7 +5,7 @@
 use core::mem::MaybeUninit;
 
 use cortex_m_rt::entry;
-use hal::prelude::OutputPin;
+use hal::prelude::{InputPin, OutputPin};
 // We need to import this crate explicitly so we have a panic handler
 use panic_rtt_target as _;
 
@@ -16,9 +16,9 @@ use nrf52832_hal as hal;
 use nrf52832_hal::gpio::Level;
 use rtt_target::{rprintln, rtt_init_print};
 use rubble::{
-    att::{Attribute, AttributeProvider, Handle},
+    att::{Attribute, AttributeAccessPermissions, AttributeProvider, Handle, HandleRange},
     config::Config,
-    l2cap::{BleChannelMap, L2CAPState},
+    l2cap::{BleChannelMap, L2CAPState, Sender},
     link::{
         ad_structure::AdStructure,
         queue::{PacketQueue, SimpleQueue},
@@ -74,8 +74,6 @@ unsafe fn main() -> ! {
     *RADIO.as_mut_ptr() = BleRadio::new(p.RADIO, &p.FICR, &mut BLE_TX_BUF, &mut BLE_RX_BUF);
     let mut radio = RADIO.as_mut_ptr().as_mut().unwrap();
 
-    // let log_sink = logger::init(ble_timer.create_stamp_source());
-
     // Create TX/RX queues
     let (tx, tx_cons) = TX_QUEUE.split();
     let (rx_prod, rx) = RX_QUEUE.split();
@@ -94,7 +92,7 @@ unsafe fn main() -> ! {
     // Send advertisement and set up regular interrupt
     let next_update = ble_ll
         .start_advertise(
-            Duration::from_millis(20), // in order to make Android see the device we need a fast interval
+            Duration::from_millis(20), // in order to make Android see the device we need a short interval
             &[AdStructure::ShortenedLocalName("Rubble")],
             &mut radio,
             tx_cons,
@@ -106,6 +104,8 @@ unsafe fn main() -> ! {
 
     let port0 = hal::gpio::p0::Parts::new(p.P0);
     let mut led = port0.p0_17.into_push_pull_output(Level::Low);
+    let button = port0.p0_13.into_pullup_input();
+    let mut button_state = false;
 
     rprintln!("READY.");
     loop {
@@ -113,6 +113,20 @@ unsafe fn main() -> ! {
             led.set_low().unwrap();
         } else {
             led.set_high().unwrap();
+        }
+
+        // do notify on button press
+        if !button_state && button.is_low().unwrap() {
+            button_state = true;
+        } else if button_state && button.is_high().unwrap() {
+            button_state = false;
+
+            // in a real application we will send a dynamic notification value
+            let ble_r = &mut *BLE_R.as_mut_ptr();
+            ble_r
+                .l2cap()
+                .att()
+                .map(|att| att.notify_raw(Handle::from_raw(0x0005), b"notify"));
         }
     }
 }
@@ -166,6 +180,7 @@ fn RADIO() {
 
 const PRIMARY_SERVICE_UUID16: Uuid16 = Uuid16(0x2800);
 const CHARACTERISTIC_UUID16: Uuid16 = Uuid16(0x2803);
+const CLIENT_CONF_UUID16: Uuid16 = Uuid16(0x2902);
 
 // Randomly generated
 // a86a62f0-5d26-4538-b364-565496151500
@@ -186,8 +201,27 @@ const MY_CHARACTERISTIC_DECL_VALUE: [u8; 19] = [
     0x01, 0x15, 0x15, 0x96, 0x54, 0x56, 0x64, 0xB3, 0x38, 0x45, 0x26, 0x5D, 0xF0, 0x62, 0x6A,0xA8,
 ];
 
+const MY_CHARACTERISTIC2_UUID128: [u8; 16] = [
+    0x02, 0x15, 0x15, 0x96, 0x54, 0x56, 0x64, 0xB3, 0x38, 0x45, 0x26, 0x5D, 0xF0, 0x62, 0x6A, 0xA8,
+];
+
+#[rustfmt::skip]
+const MY_CHARACTERISTIC2_DECL_VALUE: [u8; 19] = [
+    0x02 | 0x08 | 0x10, // 0x02 = read, 0x08 = write, 0x10 = notify
+    0x05, 0x00,  // 2 byte handle pointing to characteristic value
+
+    // 128-bit UUID of characteristic value (copied from above constant)
+    0x02, 0x15, 0x15, 0x96, 0x54, 0x56, 0x64, 0xB3, 0x38, 0x45, 0x26, 0x5D, 0xF0, 0x62, 0x6A,0xA8,
+];
+
+const MY_CHARACTERISTIC2__CHAR_CONF_VALUE: [u8; 2] = [0x00, 0x00];
+
 pub struct DemoAttrs {
-    attribs: [Attribute<&'static [u8]>; 3],
+    attribs: [Attribute<&'static [u8]>; 6],
+
+    notify_enabled: bool,
+    dynamic_attr_value_buffer: [u8; 256],
+    dynamic_attr_value_len: usize,
 }
 
 impl Default for DemoAttrs {
@@ -207,9 +241,28 @@ impl Default for DemoAttrs {
                 Attribute::new(
                     Uuid128::from_bytes(MY_CHARACTERISTIC_UUID128).into(),
                     Handle::from_raw(0x0003),
-                    b"Hello World",
+                    b"Hello World. With ReadBlob we can have looong values, too. That's great.",
+                ),
+                Attribute::new(
+                    CHARACTERISTIC_UUID16.into(),
+                    Handle::from_raw(0x0004),
+                    &MY_CHARACTERISTIC2_DECL_VALUE,
+                ),
+                Attribute::new(
+                    Uuid128::from_bytes(MY_CHARACTERISTIC2_UUID128).into(),
+                    Handle::from_raw(0x0005),
+                    &[], // we provide the value dynamically
+                ),
+                Attribute::new(
+                    CLIENT_CONF_UUID16.into(),
+                    Handle::from_raw(0x0006),
+                    &MY_CHARACTERISTIC2__CHAR_CONF_VALUE,
                 ),
             ],
+
+            notify_enabled: false,
+            dynamic_attr_value_buffer: [0; 256],
+            dynamic_attr_value_len: 0,
         }
     }
 }
@@ -243,8 +296,94 @@ impl AttributeProvider for DemoAttrs {
         handle: rubble::att::Handle,
     ) -> Option<&rubble::att::Attribute<dyn AsRef<[u8]>>> {
         match handle.as_u16() {
-            0x0001 => Some(&self.attribs[2]),
+            0x0001 => Some(&self.attribs[5]),
             0x0002 => Some(&self.attribs[2]),
+            0x0004 => Some(&self.attribs[5]),
+            _ => None,
+        }
+    }
+
+    fn find_information(
+        &mut self,
+        range: HandleRange,
+        responder: &mut Sender<'_>,
+    ) -> Result<(), rubble::Error> {
+        if range.contains(Handle::from_raw(0x0006)) {
+            responder
+                .send_with(|w| -> Result<(), rubble::Error> {
+                    w.write_slice(&[0x05u8, 0x01u8, 0x06, 0x00, 0x02, 0x29])
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+
+            Ok(())
+        } else {
+            Err(rubble::Error::InvalidValue)
+        }
+    }
+
+    fn attr_access_permissions(&self, handle: Handle) -> AttributeAccessPermissions {
+        match handle.as_u16() {
+            0x0005 => AttributeAccessPermissions::ReadableAndWriteable,
+            0x0006 => AttributeAccessPermissions::ReadableAndWriteable,
+            _ => AttributeAccessPermissions::Readable,
+        }
+    }
+
+    fn write_attr(&mut self, handle: Handle, data: &[u8]) -> Result<(), rubble::Error> {
+        match handle.as_u16() {
+            0x0005 => {
+                let end = data.len();
+                self.dynamic_attr_value_buffer[..end].copy_from_slice(data);
+                self.dynamic_attr_value_len = end;
+                Ok(())
+            }
+            0x0006 => {
+                self.notify_enabled = data[0] != 0;
+                Ok(())
+            }
+            _ => panic!("Attempted to write an unwriteable attribute"),
+        }
+    }
+
+    fn prepare_write_attr(
+        &mut self,
+        handle: Handle,
+        offset: u16,
+        data: &[u8],
+    ) -> Result<(), rubble::Error> {
+        match handle.as_u16() {
+            0x0005 => {
+                // in real code should write to a shadow buffer and commit the data in `execute_write_attr`
+                let start = offset as usize;
+                let end = offset as usize + data.len();
+                self.dynamic_attr_value_buffer[start..end].copy_from_slice(data);
+                self.dynamic_attr_value_len = usize::max(self.dynamic_attr_value_len, end);
+            }
+            _ => (),
+        }
+
+        Ok(())
+    }
+
+    fn execute_write_attr(&mut self, _flag: u8) -> Result<(), rubble::Error> {
+        // here we should commit the written values depending on `flag`
+        Ok(())
+    }
+
+    fn read_attr_dynamic(&mut self, handle: Handle, buffer: &mut [u8]) -> Option<usize> {
+        match handle.as_u16() {
+            0x0005 => {
+                buffer[..self.dynamic_attr_value_len].copy_from_slice(
+                    &self.dynamic_attr_value_buffer[..self.dynamic_attr_value_len],
+                );
+                Some(self.dynamic_attr_value_len)
+            }
+            0x0006 => {
+                buffer[0] = if self.notify_enabled { 0x01 } else { 0x00 };
+                Some(2)
+            }
             _ => None,
         }
     }
@@ -254,7 +393,8 @@ struct SimpleLogger;
 
 impl log::Log for SimpleLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Trace
+        //metadata.level() <= log::Level::Trace
+        metadata.level() <= log::Level::Debug
     }
 
     fn log(&self, record: &log::Record<'_>) {
